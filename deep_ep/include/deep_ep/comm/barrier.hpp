@@ -126,6 +126,8 @@ __aicore__ __forceinline__ void barrier(
     if constexpr (kSyncAtStart)
         AscendC::SyncAll<true>();
 
+    // dispatch/combine epilogue 传入 jetty_ptrs 时，先为所有 jetty drain 最终 CQE，再进行 UBMEM rank 信号交换。
+    // CQE/drain 解决网络发送完成，下面的 peer barrier 解决所有 rank 都到达消费边界；二者不可互相替代。
     if constexpr (kFlushStores and kNumRanks > 1 and kNumJetties > 0) {
         if (jetty_ptrs != nullptr) {
             // Distribute scalar jetty drains across all AIVs, then synchronize them.

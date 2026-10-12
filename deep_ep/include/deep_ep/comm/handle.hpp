@@ -332,6 +332,9 @@ struct HcommJetty {
         asc_sync_wait(PIPE_MTE3, PIPE_S, EVENT_ID0);
     }
 
+    // packed_head 低32位是 SQ 的 WQEBB head，高32位是预计 CQE 数。
+    // dispatch 一次提交含最终 CQE 的整批 SQE，combine 由最终 strong-order NOP 触发一次 CQE，
+    // 因而 head 前进量可以是许多 WQEBB，但 completion 只加一，drain 不能按 token 数等待。
     __aicore__ __forceinline__ void advance_sq(const uint32_t num_wqebbs) {
         const auto new_head = static_cast<uint32_t>(jetty_info->packed_head) + num_wqebbs;
         const auto new_num_completions = static_cast<uint32_t>(jetty_info->packed_head >> 32) + 1;
@@ -339,10 +342,13 @@ struct HcommJetty {
             (static_cast<uint64_t>(new_num_completions) << 32);
     }
 
+    // 中间批次只公开已准备 payload 的 SQ head，不新增预计 CQE；最终提交才调用 advance_sq。
     __aicore__ __forceinline__ void set_sq_head(const uint32_t new_head) {
         jetty_info->packed_head = (jetty_info->packed_head & 0xFFFFFFFF00000000ULL) | new_head;
     }
 
+    // 先把完整 packed head 写到持久状态并 DDR DSB，再写硬件 doorbell、再次 DSB。
+    // 这是向通信引擎提交任务，不能证明 WQE 指向的 payload 已被网络读取或写到对端。
     __aicore__ __forceinline__ void ring_doorbell() {
         AscendC::WriteGmByPassDCache(
             reinterpret_cast<__gm__ uint64_t*>(jetty_info->sq_head_addr),
@@ -407,6 +413,7 @@ struct HcommJetty {
                 jetty_info->cq_base_addr +
                 static_cast<uint64_t>(jetty_info->num_cqe_bytes) *
                     (current_tail & (jetty_info->cq_depth - 1)));
+                // CQ 环绕后同一槽含旧内容，必须同时核对 owner phase；仅见一个非零 CQE 字不足以放行。
             const auto tail_phase = (current_tail / jetty_info->cq_depth) & 1;
             const auto start_cycle = static_cast<uint64_t>(asc_get_system_cycle());
             uint32_t cqe_header = 0;
@@ -448,6 +455,7 @@ struct HcommJetty {
     }
 
     template <int64_t kNumTimeoutCycles>
+    // 只等待当前预计 completion 前缀，不在此处构造新网络任务；调用方必须先提交最终带 CQE 的 WQE。
     __aicore__ __forceinline__ void drain() {
         poll_cq<kNumTimeoutCycles>(static_cast<uint32_t>(jetty_info->packed_head >> 32));
     }

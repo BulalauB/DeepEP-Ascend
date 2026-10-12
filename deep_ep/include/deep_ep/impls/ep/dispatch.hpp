@@ -21,6 +21,12 @@
 
 namespace deep_ep {
 
+// Dispatch 的两级布局：网络按 (source token, destination rank) 去重，落 rank-major 接收区；
+// dispatch_copy_epilogue 再按该 token 的 top-k 在本卡展开为 expert-major 输入。
+// SIMT persistent worker：路由/计数、slot 分配、URMA WQE 构造；Scalar/MTE：metadata 打包和本地 hidden 拷贝。
+// 数据面：远端 payload 走 URMA write（token hidden 与 metadata 是一对 SGE）；本 rank 绕过网络。
+// 控制面：计数与 barrier 使用 symmetric peer 地址/UBMEM。count 就绪不代表 URMA payload 已完成。
+// 不是 MegaMoE 的“专家端逐 route 远程 pull”，也不包含 GMM/SwiGLU 计算。
 static constexpr int kNumWQEBBsPerSQESlot = 4;
 
 template <int kNumExperts, int kNumRanks, int kNumMaxURMAEntries, int kNumMaxLocalCopies>
@@ -28,23 +34,34 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
     static constexpr int kNumMaxSGEs = kNumMaxURMAEntries + kNumRanks * handle::kNumMaxSGEPairsPerSQE;
 
     // Stats
+    // expert_histogram 统计有效专家 route 数（尚未按 rank 去重）；rank_histogram 统计每目标 rank 的唯一 token 数。
+    // 一个 token 命中同 rank 两个专家时，专家总数 +2，而该 rank 的网络 token 数仅 +1。
     int expert_histogram[kNumExperts];
     int rank_histogram[kNumRanks];
     int rank_psum[kNumRanks];
 
     // SGE metadata
     int sgep_idx[kNumMaxURMAEntries];
+    // 逆映射：逻辑 SGE-pair 位置 -> 本 AIV token/top-k entry；-1 是末尾 SQE 的空 pair，不生成 payload SGE。
     int sgep_to_entry[kNumMaxSGEs];
     int dst_rank_idx[kNumMaxURMAEntries];
     int dst_slot_idx[kNumMaxURMAEntries];
 
     // SQE metadata
     // NOTES: only the physical SQE is for networking
+    // 逻辑 SQE 按 peer 分段预留，物理 SQE 用原子计数分配实际 SQ 槽；二者都不等于有效 route 数。
     int lsqe_counter, psqe_counter;
     int lsqe_base_idx[kNumRanks];
 
     // Local copy status
     // Scalar will do copy using this flags
+    // 双向 UB 握手：SIMT 发布 local_copy_ready 后 Scalar 可用最终 local slot；
+    // Scalar 排空 metadata MTE3 后发布 metadata_ready，SIMT 才把本地 metadata 写到接收区。
+    // 本次调用的阶段边界（接收侧不可混淆）：
+    //   local_copy_ready : slot 计算完成，允许 Scalar 本地 copy；尚未保证 WQE/远端 payload 完成。
+    //   metadata_ready   : metadata_send_buffer 已完成 GM 写，允许 SIMT 读取它；不等于网络完成。
+    //   VF V->S wait     : SIMT WQE/count/local metadata 已结束，允许 Scalar 敲 doorbell。
+    //   epilogue barrier: 本地 MTE3 + jetty CQ drain + 全 rank 到达，允许读接收 token。
     volatile int local_copy_ready, metadata_ready;
     int local_copy_dst_slot_idx[kNumMaxLocalCopies];
 
@@ -58,6 +75,8 @@ template <typename ub_layout_t, int kNumHiddenBytes, int kNumSFPacks, int kNumTo
 struct UBLayoutWithBuffer {
     static constexpr int kNumMetadataTokenBytes = layout::TokenLayout(0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes();
     static constexpr int kNumHiddenMTEStageBytes = math::align(kNumHiddenBytes, kNumUbAlignmentBytes);
+    // 先为路由 scratch 和至少一份 hidden 槽保留空间；余量分配 metadata batch 槽，然后再计算 hidden 槽数。
+    // 两个流水阶段先后使用相同事件号，但结束 metadata 时必须 drain，才能启动 hidden 的槽复用。
     static constexpr int kNumAvailableMetadataBytes = kNumUbBytes - static_cast<int>(sizeof(ub_layout_t)) - kNumHiddenMTEStageBytes;
     EP_STATIC_ASSERT(kNumAvailableMetadataBytes >= 4 * kNumMetadataTokenBytes, "Insufficient dispatch UB buffer space");
     static constexpr int kNumTokensPerMetadataMTE = kNumAvailableMetadataBytes / kNumMetadataTokenBytes >= 64 ? 64 : 4;
@@ -130,6 +149,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     asc_syncthreads();
 
     // Each AIV owns a bounded contiguous token range, including the final partial range.
+    // cached 模式复用首次 dispatch 的 rank 去重结果、接收 slot 与 SGE 逆映射；新的 x/scale/weight 仍要传输。
+    // 这是路由布局缓存，不能当成“缓存了上一轮 token payload”；调用方必须维持 handle 对应的路由。
     if constexpr (kCachedMode) {
         // Restore the cached slots and inverse SGE mapping for this vector core.
         int max_gsge_idx = -1;
@@ -154,6 +175,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             asc_atomic_max(&ub_layout->lsqe_counter, math::ceil_div(max_gsge_idx + 1, kNumSGEPairsPerSQE));
     } else {
         // If topk is small, a single warp can scan multiple tokens
+        // 取 >=topk 的最小二次幂作 token 子组宽度，warp 内可处理多个 token；补齐 lane 的 expert=-1。
+        // routing_group_mask 严格限定本 token，防止相同 rank 在相邻 token 之间被错误去重。
         static constexpr int num_threads_per_group = kNumTopk == 1 ? 1 : 1 << (32 - __builtin_clz(static_cast<unsigned>(kNumTopk - 1)));
         static constexpr int num_groups_per_wave = kNumThreads / num_threads_per_group;
         const int group_idx = thread_idx / num_threads_per_group;
@@ -175,14 +198,19 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
                 int dst_expert_idx = -1;
                 if (group_lane_idx < kNumTopk)
                     dst_expert_idx = static_cast<int>(topk_idx[token_idx * kNumTopk + group_lane_idx]);
+                // 先统计专家 route：每个 top-k 槽保留独立专家归属；rank 去重仅减少 token 的网络副本。
                 if (dst_expert_idx >= 0)
                     asc_atomic_add(ub_layout->expert_histogram + dst_expert_idx, 1);
 
                 // Deduplicate into rank indices, allocate SGEs and store rank indices
                 auto dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
+                // 对目标 rank 去重，保留同 token/rank 的最高 top-k lane；其他 lane 写 -1。
+                // 例如 token 路由专家 e0/e1 都在 rank2，仅一个 lane 为 rank2 分配 slot/SGE；
+                // 发送 metadata 仍包含完整 top-k，rank2 可恢复两份专家输入。
                 dst_rank_idx = simt::deduplicate<kNumRanks>(dst_rank_idx, lane_idx, routing_group_mask) ? dst_rank_idx : -1;
                 if (dst_rank_idx >= 0) {
                     // The results are also the SGE indices
+                    // UB 原子计数给当前 AIV 发往该 peer 的唯一 token 编号；local peer 则记录 local_copy slot，完全不占 SQ。
                     const auto dst_sgep_idx = asc_atomic_add(ub_layout->rank_histogram + dst_rank_idx, 1);
                     if (dst_rank_idx != rank_idx) {
                         ub_layout->sgep_idx[entry_idx] = dst_sgep_idx;
@@ -201,6 +229,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             // TODO: add `vec_core_idx` into shuffling
             const auto peer_rank_idx = (rank_idx + thread_idx) % kNumRanks;
             if (peer_rank_idx != rank_idx) {
+                // 每 peer 保留 ceil(unique_tokens/6) 个逻辑 SQE，一条 SQE 的所有 pair 都发给同一 peer。
+                // 不同 peer 的尾 SQE 不能合并，否则不能共用远端 header/address。
                 ub_layout->lsqe_base_idx[peer_rank_idx] = asc_atomic_add(
                     &ub_layout->lsqe_counter,
                     math::ceil_div(ub_layout->rank_histogram[peer_rank_idx], kNumSGEPairsPerSQE));
@@ -211,6 +241,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         if (thread_idx < kNumExperts) {
             asc_atomic_add(
                 workspace_layout.get_local_expert_histogram_ptr(thread_idx),
+                // 高位是一份 AIV arrival，低位为专家 count；空闲 AIV 也贡献 arrival，确保 receiver 能等待固定核数。
                 reduction::kReductionIdentity | ub_layout->expert_histogram[thread_idx]);
         }
 
@@ -222,6 +253,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             asc_threadfence();
         }
         asc_syncthreads();
+        // 本地 rank histogram 先以 arrival=1 表示原始 count；计算核读完上下两半后写 arrival=2 的 exclusive prefix。
+        // 每个 AIV 等自己行的 arrival=2 才取出 prefix，并清零该暂存行；避免把未算完的 count 当 offset。
         // calculate prefix sum of rank counts
         // local-rank-histogram-new[i, j] = \sum_{k=0}^{i-1} local-rank-histogram[k, j]
         for (int peer_idx = vec_core_idx + warp_idx * kNumVecCores; peer_idx < kNumRanks; peer_idx += kNumVecCores * kNumWarps) {
@@ -239,6 +272,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             // Finish reading both halves before replacing counts with prefixes.
             asc_threadfence();
             if (lane_idx == 0)
+                // rank_psum 是本 rank 所有 AIV 发往 peer 的 token 总数；rank_histogram 随后改为当前 AIV 的前缀。
                 ub_layout->rank_psum[peer_idx] = lower_total + upper_total;
             if (lane_idx < kNumVecCores)
                 *lower_ptr = 2 * reduction::kReductionIdentity | (lower_sum - lower);
@@ -269,8 +303,11 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
                 if (dst_rank_idx >= 0) {
                     if (dst_rank_idx != rank_idx) {
                         const auto sgep_idx = ub_layout->sgep_idx[entry_idx];
+                        // 最终 peer slot = 本 AIV 之前的 token 总数 + 本 AIV 的 token ordinal。
+                        // 所有 AIV 的区间不相交；远端 buffer 按 source rank 固定 Tmax 大小，slot 只在本 source 分区内偏移。
                         dst_slot_idx = ub_layout->rank_histogram[dst_rank_idx] + sgep_idx;
                         const auto lsqe_base_idx = ub_layout->lsqe_base_idx[dst_rank_idx];
+                        // SGE pair index = 当前 peer 的 logical SQE 基址*6 + peer 内序号；末 SQE 不满 6 时余位保持 -1。
                         global_sgep_idx = lsqe_base_idx * kNumSGEPairsPerSQE + sgep_idx;
                         ub_layout->sgep_to_entry[global_sgep_idx] = entry_idx;
                     } else {
@@ -278,6 +315,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
                     }
                 }
                 ub_layout->dst_slot_idx[entry_idx] = dst_slot_idx;
+                // 把去重后的代表 lane 的 slot/SGE 索引保存到 handle；被去重 lane 保持 -1，cached 重放时无需再次 ballot。
                 dst_buffer_slot_idx[token_idx * kNumTopk + group_lane_idx] = dst_slot_idx;
                 dst_gsge_idx[token_idx * kNumTopk + group_lane_idx] = global_sgep_idx;
             }
@@ -295,6 +333,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     }
     asc_syncthreads();
     if (thread_idx == 0)
+        // 此时本地 slot 与逆映射已写完，Scalar 可开始本地 hidden 拷贝；remote WQE 和 count reduction 可并行继续。
         ub_layout->local_copy_ready = 1;
 
     // Load descriptors while the scalar pipeline copies local payloads.
@@ -320,6 +359,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
                 workspace_layout.get_remote_rank_histogram_ptr(rank_idx),
                 peer_idx
             );
+            // 发送的是每 source->peer 的 rank 去重 token 总数，不是专家展开行数。
+            // 这条 peer 的总数由负责它的 AIV 写一次，status 高位编码完整 kNumVecCores 到达。
             *ptr = reduction::make_reduction_status(kNumVecCores, static_cast<int>(ub_layout->rank_psum[peer_idx]));
         }
     }
@@ -369,6 +410,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         // ...
         EP_STATIC_ASSERT(kNumSGEPairsPerSQE == 6);
         const auto num_sgeps = __reduce_add(entry_idx >= 0);
+        // 每个 token 用两份 SGE：原始 x hidden（不先打包复制）+ GM metadata（SF、top-k/weight、source ID）。
+        // 接收地址连续写 [hidden|metadata]，因此一 SQE 可串联最多 6 个同 peer token。
         const auto num_sges = num_sgeps * 2;
         const auto num_wqebbs = math::ceil_div(
             static_cast<int>(sizeof(AscendC::HcommUrmaSqeCtx) + num_sges * sizeof(AscendC::HcommUrmaSgeCtx)),
@@ -385,12 +428,14 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             static_cast<uint32_t>(ub_layout->jetty_info.packed_head) +
             psqe_idx * kNumWQEBBsPerSQESlot;
         const auto wqebb_head = slot_head + lane_idx / kNumWQEBBLanes;
+        // SQ 环通过 masked index 定位 WQEBB，owner bit 随环回绕翻转，区分旧队列内容与本代新 WQE。
         const auto owner_bit = static_cast<uint64_t>((wqebb_head & handle::kSQDepth) == 0) << 31;
         const auto sq_wqebb_idx = wqebb_head % handle::kSQDepth;
 
         uint64_t sqe_word = 0;
         if (lane_idx == 0) {
             sqe_word = handle::kWriteSQEHeaderTemplate | owner_bit | static_cast<uint64_t>(sq_wqebb_idx);
+            // 最后一条物理 SQE 请求强序和 CQE；后续 drain 通过该完成点回收队列，不能只看 doorbell 已发。
             // Request strong order and CQE for the last physical SQE.
             if (psqe_idx + 1 == num_sqes)
                 sqe_word |= handle::kWriteSQEFinalFlags;
@@ -399,6 +444,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             if (lane_idx == 1)
                 sqe_word |= static_cast<uint64_t>(num_sges) << 24;  // num_sges
             if (lane_idx == 5)
+                // remote peer base 加“当前 source rank 分区”的 recv_buffer_offset，再加去重后的 peer slot*token stride。
+                // 相同 token 发给不同 rank 可以共享本地 x/metadata 源地址，各目标拥有独立接收地址。
                 sqe_word += recv_buffer_offset + static_cast<uint64_t>(sqe_dst_slot_idx) * num_token_bytes;  // remote_addr
         } else if (lane_idx < kNumWriteHeaderLanes + num_sgeps * kNumSGEPairLanes) {
             const auto sgep_lane_idx = (lane_idx - kNumWriteHeaderLanes) % kNumSGEPairLanes;
@@ -413,6 +460,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
                 sqe_word = reinterpret_cast<uint64_t>(metadata_send_buffer) +
                     static_cast<uint64_t>(token_idx) * num_metadata_bytes;
             }
+        // 每逻辑 SQE 固定预留 4 个 WQEBB；实际条目不足时以 NOP 补齐，使 slot 步长和 SQ 对齐不变。
         } else if (lane_idx >= num_wqebbs * kNumWQEBBLanes and lane_idx % kNumWQEBBLanes == 0) {
             sqe_word = handle::kNopSQEHeaderTemplate | owner_bit | static_cast<uint64_t>(sq_wqebb_idx);
         }
@@ -428,6 +476,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         // NOTES: if you do `syncthreads`, please make sure the `i` iteration count is same
     }
 
+    // WQE 可以先写，但 source metadata 尚在 Scalar/MTE3 生产时不能让网络读取。
+    // SIMT 等 metadata_ready 后复制本地 metadata；Scalar 随后等整个 VF 完成才敲 remote doorbell。
     while (ub_layout->metadata_ready != 1)
         simt::nop<15>();
     asc_syncthreads();
@@ -445,9 +495,12 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         }
     }
 
+    // cached 模式复用原 rank/expert prefix，所以本地 metadata 拷贝后无需重做两级计数汇总。
     if constexpr (kCachedMode)
         return;
 
+    // AIV0 负责专家计数：先等本 rank 所有 AIV histogram，再给专家 owner rank 原子贡献一份 source count。
+    // 接收端等所有 rank（包括 count=0）到齐；只参与 count reduction，不证明 URMA 数据到达。
     // Expert reduction: wait for all vector cores, send to remote and clean reduction workspace
     if (vec_core_idx == 0 and thread_idx < kNumExperts) {
         const auto status = reduction::simt::wait_ready(
@@ -479,6 +532,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             *host_workspace_layout.get_host_expert_count_ptr(thread_idx) =
                 reduction::make_reduction_status(kNumRanks, math::align(num_recv_tokens, kExpertAlignment));
         }
+        // 真实专家行数用于统计；host 收到的 aligned count 用于分配/padding，不可将对齐行计入实际专家负载。
         num_unaligned_recv_tokens_per_expert[thread_idx] = num_recv_tokens;
         ub_layout->expert_histogram[thread_idx] = num_recv_tokens;
         if (cumulative_local_expert_recv_stats != nullptr)
@@ -492,6 +546,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads);
     EP_STATIC_ASSERT(kNumVecCores > 1);
     if (vec_core_idx == 1 and thread_idx < kNumRanks) {
+        // AIV1 收集每个 source rank 发往本 rank 的唯一 token 数，生成 rank-major 接收流 prefix。
         // Wait remote arrival
         ub_layout->rank_psum[thread_idx] = reduction::get_reduction_value(
             reduction::simt::wait_ready<kNumTimeoutCycles>(
@@ -516,6 +571,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             // Store into global memory
             // NOTES: elements in psum are aligned, but the current value is not aligned
             if (idx < kNumExpertsPerRank)
+                // 专家 end = 前序专家 aligned 容量之和 + 当前真实 count；下一专家 start=align(当前 end)。
+                // 因此 prefix 同时保留有效行尾部和专家间 padding，不是单纯的累计有效 route 数。
                 psum_num_recv_tokens_per_expert[idx] = inclusive_psum + exclusive_warp_psum + value;
 
             // Maintain in-loop psum
@@ -613,6 +670,8 @@ __global__ __vector__ void dispatch_impl(
     const auto workspace_layout = layout::EPWorkspaceLayout(workspace);
     const auto host_workspace_layout = layout::EPWorkspaceLayout(host_workspace);
 
+    // hidden 是调用方数据的原始字节；FP8 输入时附 SF，BF16 输入通常无 SF，此 kernel 不执行量化。
+    // 非 cached token 带完整 top-k ID/weight/source ID；cached 保留 SF/weight，路由身份来自旧 handle。
     // Token and buffer layouts
     // Cached dispatch reuses source metadata from the handle; only SF and weights travel again.
     const auto token_layout = layout::TokenLayout(
@@ -639,6 +698,8 @@ __global__ __vector__ void dispatch_impl(
         math::advance_ptr<void>(ub->metadata, 0)
     );
 
+    // 进入时跨 rank 对齐本代生命周期；出发前的 barrier 无法保证本代后续 URMA write 完成。
+    // 接收 epilogue 才用带 jetty drain 的 barrier 建立数据可消费边界。
     // Barrier before dispatch
     // NOTES: this costs 4 us (8 ranks)
     // NOTES: marking is for aligning different ranks' time
@@ -685,6 +746,8 @@ __global__ __vector__ void dispatch_impl(
         );
     }
 
+    // metadata 采用多 stage GM->UB->GM 打包：SF 支持跨 token/channel stride，top-k ID 与 weight 另行读入。
+    // 统一连续 metadata_send_buffer 供网络 SGE 引用，hidden SGE 则直接引用 x，不需要完整 token 预打包。
     auto preload_metadata = [&](const int token_idx, const int stage_idx) __aicore__ {
         const auto ub_metadata = ub_metadata_buffer.get_token_buffer(stage_idx * kNumTokensPerMetadataMTE);
         const auto num_metadata_bytes = static_cast<uint32_t>(metadata_token_layout.get_num_bytes());
@@ -693,10 +756,12 @@ __global__ __vector__ void dispatch_impl(
             math::max(0, math::min(num_tokens, (vec_core_idx + 1) * kNumMaxTokensPerVecCore) - token_idx));
 
         // Copy metadata within this AIV's contiguous token range
+        // 首次预置 MTE3->MTE2 credit；后续复用必须等待旧 metadata 的 UB->GM 拷贝不再读此槽。
         asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
         if constexpr (kNumSFPacks > 0) {
             const auto gm_sf = math::advance_ptr<__gm__ sf_pack_t>(
                 sf, static_cast<int64_t>(token_idx) * sf_token_stride * sizeof(sf_pack_t));
+            // 连续 SF 直接按 token burst 读取；非连续 channel scale 使用二维 NDDMA，目标统一为紧凑 token record。
             if (sf_hidden_stride == 1) {
                 asc_copy_gm2ub_align(
                     ub_metadata.template get_sf_ptr<__ubuf__ sf_pack_t>(), gm_sf,
@@ -776,6 +841,7 @@ __global__ __vector__ void dispatch_impl(
             for (int i = 0; i < num_tokens_in_stage; ++ i) {
                 const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + first_metadata_idx + i;
                 const auto ub_metadata = ub_metadata_buffer.get_token_buffer(stage_idx * kNumTokensPerMetadataMTE + i);
+                // 全局 source ID=source rank*Tmax+本地 token；Tmax 是注册容量 stride，不随本次 T 改变。
                 *ub_metadata.template get_src_token_global_idx_ptr<__ubuf__ int>() = rank_idx * kNumMaxTokensPerRank + token_idx;
             }
         }
@@ -798,8 +864,10 @@ __global__ __vector__ void dispatch_impl(
         asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
     asc_sync_notify(PIPE_MTE2, PIPE_S, EVENT_ID0);
     asc_sync_wait(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    // 所有活跃 metadata stage 的 MTE3 都已 drain；此 flag 发布后 SIMT/URMA 可读取 GM metadata。
     ub_layout->metadata_ready = 1;
 
+    // Scalar 等 SIMT 最终 slot 映射；不必等 SIMT 完成远端 WQE/全局 count，从而重叠本地 DMA。
     while (ub_layout->local_copy_ready != 1)
         asm volatile("nop");
 
@@ -826,6 +894,7 @@ __global__ __vector__ void dispatch_impl(
             );
             asc_sync_notify(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(hidden_stage_idx));
 
+            // 本地 token 同样只复制一次，落入本 source rank 的 rank-major 分区；多个本地专家副本由接收 epilogue 生成。
             // Copy token data into the local receive buffer
             asc_sync_wait(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(hidden_stage_idx));
             asc_copy_ub2gm_align(
@@ -844,6 +913,8 @@ __global__ __vector__ void dispatch_impl(
     asc_sync_notify(PIPE_MTE2, PIPE_S, EVENT_ID0);
     asc_sync_wait(PIPE_MTE2, PIPE_S, EVENT_ID0);
 
+    // metadata、本地 hidden 和 SIMT descriptors 分别完成后才敲门铃；WQE 已存在不等于硬件已开始读取。
+    // 此 issue kernel 默认不等待本代全部 URMA 完成，x 与 metadata_send_buffer 必须存活到 epilogue drain。
     // Wait until SIMT finishes routing and count reduction
     // TODO: ring DB overlappingly
     asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
@@ -852,6 +923,7 @@ __global__ __vector__ void dispatch_impl(
         EP_DEVICE_ASSERT(kNumMaxSQEs * kNumWQEBBsPerSQESlot <= handle::kSQDepth);
     const auto num_sqes = ub_layout->lsqe_counter;
     if (num_sqes > 0) {
+        // head 的单位为 WQEBB，不是 token 或 SGE；一个固定 logical SQE slot 占 4 个 WQEBB。
         jetty.advance_sq(num_sqes * kNumWQEBBsPerSQESlot);
         EP_DEVICE_ASSERT(static_cast<uint32_t>(ub_layout->jetty_info.packed_head) % kSQEBBAlignment == 0);
         jetty.ring_doorbell();

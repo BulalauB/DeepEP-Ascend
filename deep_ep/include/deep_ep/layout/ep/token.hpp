@@ -6,7 +6,15 @@
 
 namespace deep_ep::layout {
 
+// Dispatch wire record（hidden 按调用方 dtype 原字节，kernel 不量化）：
+//   [hidden][对齐 SF（若有）][对齐 int64 topk IDs（非 cached）][float topk weights][int source-global-ID（非 cached）]
+// 整个 metadata 区再按 UB alignment 补齐；cached 省略 IDs/source-ID，但仍携带新 SF/weights。
+// Combine 使用另一种 record：BF16 hidden + padded float weights，不发送 top-k IDs/source ID，目的地由 handle 恢复。
 struct TokenLayout {
+    // 字节数示例：FP8 H7168、SF=224B、topk=6、非cached：
+    // ID区 align(6*8,32)=64B，metadata align(64+6*4+4,32)=96B，record=7168+224+96=7488B。
+    // cached 去掉ID/source，metadata仅align(24,32)=32B，record=7424B；hidden/SF仍逐轮传输。
+    // 相同H的combine则为BF16 hidden14336B + weight32B =14368B，不复用dispatch record stride。
     int num_hidden_bytes;
     int num_sf_bytes;
     bool with_metadata;
@@ -21,6 +29,7 @@ struct TokenLayout {
         num_sf_bytes(num_sf_bytes),
         with_metadata(with_metadata),
         num_topk(num_topk),
+        // weight 长度固定为 topk*sizeof(float)；with_metadata 额外加 aligned ID 区与 source-global-ID。
         num_metadata_bytes(num_topk * sizeof(float) +
                            (with_metadata ? math::align<int>(num_topk * sizeof(int64_t), kNumUbAlignmentBytes) + sizeof(int) : 0)),
         base(base) {
@@ -33,6 +42,7 @@ struct TokenLayout {
         const int& num_hidden_bytes, const int& num_topk, uint8_t* base = nullptr):
         TokenLayout(num_hidden_bytes, 0, num_topk, true, base) {}
 
+    // skip_hidden=true 返回网络第二个 SGE 的 metadata 总字节数（含 SF），不是跳过全部量化/路由信息。
     constexpr __aicore__ __forceinline__ int64_t get_num_bytes(const bool& skip_hidden = false) const {
         if (num_sf_bytes > 0) {
             return (skip_hidden ? 0 : num_hidden_bytes) +
@@ -115,6 +125,7 @@ struct BufferLayout {
         return math::advance_ptr<void>(base, get_num_bytes());
     }
 
+    // source rank 分区 stride = Tmax*token_bytes；接收时该 source 的去重 token slots 在此固定区间内压紧。
     constexpr __aicore__ __forceinline__ BufferLayout get_rank_buffer(const int& rank_idx) const {
         return BufferLayout(
             token_layout, 1, num_max_tokens_per_rank,

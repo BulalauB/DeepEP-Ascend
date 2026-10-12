@@ -253,6 +253,8 @@ public:
             std::atomic_thread_fence(std::memory_order_seq_cst);
         }
 
+        // dispatch issue 只提交去重 token 的网络写与计数；后续 epilogue 等完成，再展开成本地专家输入。
+        // metadata_send_buffer/x 必须跨两个阶段存活，handle 保存 slot/SGE/recv metadata 供 cached 或 combine 重放。
         // Launch dispatch
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -485,6 +487,7 @@ public:
         const auto send_buffer = torch::empty(
             {num_reduced_tokens, token_layout.get_num_bytes()}, x.options().dtype(torch::kByte));
 
+        // combine issue 先对同一 token 的本卡专家行做 partial，再按 source rank 回传；最终输出由 source epilogue 求和。
         // Push data into remote reduce buffers
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
         const auto reduce_buffer = launch_combine(
@@ -506,6 +509,8 @@ public:
             barrier_in_prologue
         );
 
+        // 异步网络 DMA 的源既可能是 x（单专家直接发送），也可能是 send_buffer（多专家 partial）。
+        // 即使 issue kernel 返回也不能释放它们；lambda 捕获 tensor/context 直到接收 epilogue 排队执行 drain。
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, send_buffer = send_buffer, context = context]() {

@@ -15,6 +15,10 @@
 
 namespace deep_ep {
 
+// 接收端展开：网络只接收每 token/rank 一份 record，这里对完整 top-k 筛选本卡专家并本地复制。
+// 输出 recv_x/recv_sf 按专家连续排列；recv_src_metadata 按 rank-major 去重接收流排列，保存反向 combine 映射。
+// 非 cached：先统计本 AIV 专家 count，构建跨 AIV exclusive prefix，再展开。
+// cached：复用既有 recv_src_metadata 中的专家 dst_slot，跳过 histogram/prefix，仍复制本轮新数据。
 using namespace __cce_simd;
 
 // ptr must be 32-byte aligned; num_elems may be arbitrary.
@@ -67,6 +71,7 @@ __simd_vf__ void histogram_accumulate_u32(__ubuf__ int64_t* data, __ubuf__ uint3
         asc_deintlv((vector_u16&)value_0, ignored_0, sampled_0, sampled_1);
         asc_deintlv((vector_u16&)value_1, ignored_1, sampled_2, sampled_3);
 
+        // 减本 rank 专家 ID 起点后，只有 0..kNumBins-1 的本地专家进入 histogram；-1 padding 不计数。
         asc_sub(value_0, value_0, offset_vec, mask_b16);
         asc_sub(value_1, value_1, offset_vec, mask_b16);
 
@@ -94,6 +99,7 @@ __simd_vf__ void histogram_accumulate_u32(__ubuf__ int64_t* data, __ubuf__ uint3
         asc_unpack_upper(hist_p1, hist[hist_idx]);
         asc_deintlv(hist_0, hist_1, hist_p0, hist_p1);
         asc_loadalign_deintlv(acc_0, acc_1, histogram_offset);
+        // 每批硬件 histogram 的 uint16 结果先扩成 uint32，再累计到 UB 全范围 count，避免跨批计数溢出。
         asc_add(hist_0, hist_0, acc_0, mask_b32);
         asc_add(hist_1, hist_1, acc_1, mask_b32);
         asc_storealign_intlv(histogram_offset, hist_0, hist_1);
@@ -128,6 +134,7 @@ __simd_vf__ void initialize_dst_slot_idx(__ubuf__ uint32_t* dst_slot_idx,
 }
 
 template <int kNumRanks>
+// 将逻辑紧凑 rank-major 接收流映射到固定 source-rank 分区；分段搬运不能跨 peer 分区边界。
 struct PSumIterator {
     __gm__ const int* psum;
     int token_idx;
@@ -153,6 +160,7 @@ struct PSumIterator {
 
     __aicore__ __forceinline__ void advance_to(const int target_token_idx) {
         token_idx = target_token_idx;
+        // prefix 相等表示该 rank 收到零 token，循环跳过空区间；本地 slot = 紧凑全局 token_idx - rank_start。
         while (target_token_idx >= rank_end_idx and rank_idx + 1 < kNumRanks) {
             rank_start_idx = rank_end_idx;
             ++ rank_idx;
@@ -165,6 +173,7 @@ struct PSumIterator {
     }
 
     __aicore__ __forceinline__ int get_contiguous_count(const int max_tokens) const {
+        // 一个 DMA batch 同时受当前 source rank 区间、当前 AIV 范围、UB stage 容量限制。
         return math::min(math::min(rank_end_idx - token_idx, token_end_idx - token_idx), max_tokens);
     }
 
@@ -196,6 +205,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
 
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
     const auto workspace_layout = layout::EPWorkspaceLayout(workspace);
+    // 先 drain 各发送 jetty 的最终 CQE，再跨 rank barrier；count prefix 已就绪仍不足以证明 payload 可读。
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
             kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores, kNumVecCores>(
@@ -251,17 +261,20 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
     EP_STATIC_ASSERT(kNumMTEStages > 0);
 
     const auto ub_expert_token_count = reinterpret_cast<__ubuf__ uint32_t*>(0);
+    // UB 专家 histogram 完成后复用为专家写指针；同一地址的含义随阶段切换，不可在统计阶段提前覆盖。
     const auto ub_next_dst_slot_idx = ub_expert_token_count; // reuse the ub_expert_token_count buffer
     const auto ub_psum_num_recv_tokens_per_expert = math::advance_ptr<__ubuf__ uint32_t>(ub_expert_token_count, kNumHistogramBins * sizeof(uint32_t));
     const auto ub_histogram = math::advance_ptr<__ubuf__ int64_t>(ub_psum_num_recv_tokens_per_expert, kNumHistogramBins * sizeof(uint32_t));
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode);
     const auto recv_buffer = layout::BufferLayout(token_layout, kNumRanks, kNumMaxTokensPerRank, math::advance_ptr<void>(buffer, 0));
+    // histogram DMA scratch 排空后复用为完整 token 搬运 stage；metadata 两槽位于其后，事件号独立分配。
     const auto ub_token_buffer = layout::BufferLayout(token_layout, kNumMTEStages, kNumTokensPerStage, math::advance_ptr<void>(ub_histogram, 0));
     const auto ub_metadata_buffers = math::advance_ptr<__ubuf__ int>(ub_token_buffer.get_buffer_end_ptr(), 0);
     const auto ub_zero_buffer = math::advance_ptr<__ubuf__ uint8_t>(ub_metadata_buffers, kNumMetadataStages * kNumMetadataStageBytes);
 
     if constexpr (not kCachedMode) {
         asc_set_copy_pad_val(static_cast<uint32_t>(0));
+        // 加载前一专家 end，左补零形成当前专家 start 的原始值；initialize_dst_slot_idx 再按 expert_alignment 对齐。
         // expert-start[expert_id] = align(expert-end[expert_id - 1], kExpertAlignment)
         // we first load ub_psum_num_recv_tokens_per_expert[expert_id] = expert-end[expert_id - 1]
         if constexpr (kNumExpertsPerRank == 1) {
@@ -279,6 +292,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
 
     const auto num_recv_tokens = psum_num_recv_tokens_per_rank[kNumRanks - 1];
     const auto num_tokens_per_vec_core = math::ceil_div(num_recv_tokens, kNumVecCores);
+    // 各 AIV 分配紧凑接收流的连续区间，不等于某一个源 rank 的连续 buffer；PSumIterator 负责转换。
     const auto token_start_idx = math::min(num_recv_tokens, vec_core_idx * num_tokens_per_vec_core);
     const auto token_end_idx = math::min(num_recv_tokens, token_start_idx + num_tokens_per_vec_core);
 
@@ -302,6 +316,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
             .template get_base_ptr<__gm__ uint8_t>();
 
         // refills wait until the consumer's MTE3 copies that read this stage have completed
+        // 旧 token stage 可能同时供多个专家的 MTE3 读取；必须等全部读取结束才补下一批 record。
         if (not is_preload) {
             asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(kNumMetadataStages + load_stage_idx));
         }
@@ -316,6 +331,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
 
         stage_num_tokens[load_stage_idx] = num_stage_tokens;
         // global recv-stream position: recv_src_metadata is indexed by the global stream
+        // 记录紧凑接收流全局位置；recv_src_metadata 以该位置索引，不使用 source 固定分区的 slot。
         stage_token_base_idx[load_stage_idx] = issue_iter.token_idx;
 
         issue_iter.advance(num_stage_tokens);
@@ -337,6 +353,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
             (__ubuf__ int *)ub_expert_token_count,
             kNumExpertsPerRank * sizeof(int)
         );
+        // 每 AIV 先清自己的 GM prefix row，再汇合全部清零；不能在其他核清零前开始 atomic broadcast。
         asc_sync_inter_arrive(PIPE_MTE3, kExpertCountClearedBarrier);
 
         PSumIterator<kNumRanks> topk_iter(psum_num_recv_tokens_per_rank, token_start_idx, token_end_idx);
@@ -368,6 +385,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
             asc_sync_notify(PIPE_MTE2, PIPE_V, static_cast<event_t>(histogram_stage_idx));
 
             asc_sync_wait(PIPE_MTE2, PIPE_V, static_cast<event_t>(histogram_stage_idx));
+            // 完整 top-k 在每目标 rank 都收到一次；只数本卡专家，因此可恢复被网络 rank 去重合并的多条专家路由。
             histogram_accumulate_u32<kNumHistogramBins>(
                 ub_hist_ptr, ub_expert_token_count,
                 num_stage_tokens * kNumHistogramTokenTopkElems,
@@ -387,6 +405,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
         asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID0);
 
         // reserve 1 issue slot for the later gm2ub copy
+        // histogram 已结束，可提前提交完整 token 预取；保留一个 MTE2 issue slot 给后面的 prefix GM->UB。
         while (preload_stage_idx < kNumMTEStages and get_iqent(PIPE_MTE2) > 1) {
             issue_load(preload_stage_idx, true);
             preload_stage_idx ++;
@@ -395,6 +414,8 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
         asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID0);
         asc_sync_inter_wait(PIPE_MTE3, kExpertCountClearedBarrier);
         if (vec_core_idx + 1 < kNumVecCores) {
+            // 当前 AIV 的本地专家 count 向所有后序 AIV row 做 atomic add：row c 最终是 sum(count[0:c])。
+            // 这是专家展开的 exclusive prefix；atomic add 累加的是 count，不是专家 hidden 输出。
             // Atomic & Broadcast Trick
             //
             // int expert_count[kNumVecCores][kNumExperts];
@@ -423,6 +444,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
         );
         asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);
         asc_sync_wait(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        // 专家输出起点 + 当前 AIV 的专家内 exclusive prefix，得到本核每专家独占的写区间。
         initialize_dst_slot_idx<kNumHistogramBins, kExpertAlignment>(ub_next_dst_slot_idx, ub_psum_num_recv_tokens_per_expert);
         asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
         asc_sync_wait(PIPE_V, PIPE_S, EVENT_ID0);
@@ -465,6 +487,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
             const auto ub_metadata = math::advance_ptr<__ubuf__ int>(
                 ub_metadata_buffers,
                 metadata_buffer_idx * kNumMetadataStageBytes + token_in_stage * kNumMetadataBytesPerToken);
+            // 保存本 token 命中本 rank 的最后一个 top-k 槽，和源端 rank 去重“保留最后 lane”的规则一致。
             int master_topk_slot_idx = -1;
 
             #pragma unroll
@@ -473,6 +496,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
                 int dst_slot_idx;
                 bool has_dst_slot;
                 if constexpr (kCachedMode) {
+                    // cached handle 已保存 j->专家展开行号；无需本轮 top-k ID 上线，也不能用于任意新路由。
                     dst_slot_idx = metadata_ptr[j];
                     has_dst_slot = dst_slot_idx >= 0;
                 } else {
@@ -482,11 +506,14 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
                     has_dst_slot = 0 <= local_expert_idx and local_expert_idx < kNumExpertsPerRank;
                     if (has_dst_slot) {
                         dst_slot_idx = static_cast<int>(ub_next_dst_slot_idx[local_expert_idx]);
+                        // 每次有效 route 分配一行并自增，即使多条 route 命中同卡也各有专家输入；减少的是网络副本，不是计算行。
                         ub_next_dst_slot_idx[local_expert_idx] = dst_slot_idx + 1;
                         master_topk_slot_idx = j;
                     }
                 }
 
+                // 同一 UB token 可被多条本地 route 的 MTE3 复用：hidden/SF 复制到各专家行，weight 取该 route 的 j。
+                // 例如 e0/e1 同卡，只跨卡接收一次，却在本地写两行，各自保留不同路由权重。
                 // Issue MTE3
                 if (has_dst_slot) {
                     asc_copy_ub2gm_align(
@@ -512,18 +539,23 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
                 }
 
                 if constexpr (not kCachedMode)
+                    // metadata[j] 为本地专家输出行或 -1；combine 用这组行号将同 token 的本卡专家结果先求和。
                     ub_metadata[j] = dst_slot_idx;
             }
 
             // Write metadata
             if constexpr (not kCachedMode) {
+                // 尾部两个 int 保存 source_global_token 和 master_topk_slot；用于恢复源 token 与回传子槽。
                 ub_metadata[kNumTopk] = *reinterpret_cast<volatile __ubuf__ int*>(token.get_src_token_global_idx_ptr<__ubuf__ int>());
                 ub_metadata[kNumTopk + 1] = master_topk_slot_idx;
             }
         }
+        // 一份 token 被全部命中专家消费后才释放 stage；否则后续预取可能覆盖仍被 MTE3 多播读取的 UB。
         // stage consumed: the producer's next load for this stage waits on this signal
         asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(kNumMetadataStages + stage_idx));
 
+        // metadata ping-pong 的 MTE3->Scalar credit 与 token stage 的 MTE3->MTE2 credit 不同。
+        // Scalar 填好 metadata 后发 S->MTE3，GM 写完后才允许同槽写下一批。
         // flush metadata buffer to global memory
         if constexpr (not kCachedMode) {
             asc_sync_notify(PIPE_S, PIPE_MTE3, static_cast<event_t>(metadata_buffer_idx));
@@ -554,6 +586,7 @@ __global__ __vector__ void dispatch_copy_epilogue_impl(
             const auto first_expert_idx = (vec_core_idx + part_idx * kNumVecCores / kNumPaddingParts) % kNumVecCores;
             for (int expert_idx = first_expert_idx; expert_idx < kNumExpertsPerRank; expert_idx += kNumVecCores) {
                 const auto expert_token_end_idx = psum_num_recv_tokens_per_expert[expert_idx];
+                // 仅对 [真实 expert end, align(end)) 的 padding 行清零；这些行不在 src_metadata 的有效 route 映射内。
                 const auto num_pad_tokens = math::align(expert_token_end_idx, kExpertAlignment) - expert_token_end_idx;
                 const auto num_tokens_per_part = num_pad_tokens / kNumPaddingParts;
                 const auto num_extra_tokens = num_pad_tokens % kNumPaddingParts;

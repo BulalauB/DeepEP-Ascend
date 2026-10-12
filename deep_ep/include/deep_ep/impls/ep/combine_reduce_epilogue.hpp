@@ -16,6 +16,8 @@
 
 namespace deep_ep {
 
+// 还原 weight 元数据：每个 rank 只在自己负责的 top-k 位置填 float 原始位，其他位置是 0。
+// 逐 rank bitwise OR 汇合互斥位置；它不是数值相加，也不用于乘 hidden。
 template <int kNumTopk, int kNumTokenElems, int kNumSlots, int kNumHiddenElems>
 __simd_vf__ __forceinline__ void restore_combine_weights(
     __ubuf__ uint32_t* ub_tokens, __ubuf__ uint32_t* ub_output,
@@ -24,6 +26,7 @@ __simd_vf__ __forceinline__ void restore_combine_weights(
     const auto mask = asc_update_mask_b32(remaining);
     vector_uint32_t result;
     asc_duplicate_scalar(result, static_cast<uint32_t>(0), mask);
+    // weight 位于每个环槽 hidden 后的 extra 区；先读槽尾部连续段，再处理回绕的槽头部。
     const auto num_wrap_tokens = math::min(kNumSlots - first_token_idx, num_tokens);
     auto ub_input = ub_tokens + (first_token_idx * kNumTokenElems + kNumHiddenElems) / 2;
     #pragma unroll 1
@@ -59,12 +62,15 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
     AscendC::InitSocState();
 
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
+    // 带 jetty drain 的跨 rank 屏障等待 URMA payload/CQE，再读取各 producer 的 partial。
+    // 与纯 count 就绪或 MTE3 本地完成不同，它还负责发送源数据的网络生命周期收尾。
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
             kNumRanks, kNumTimeoutCycles, true, false, true, kNumVecCores, kNumVecCores>(
                 static_cast<__gm__ layout::EPSignals*>(workspace)->common_signals, vec_core_idx, jetty_ptrs);
 
     static constexpr int kNumWeightBytes = math::align(kNumTopk * static_cast<int>(sizeof(float)), kNumUbAlignmentBytes);
+    // UB ring 每槽包含 BF16 hidden 与 padded weight；预留 min(rank,topk) 个 partial 加最多两个 bias。
     static constexpr int kNumHiddenSlots = math::min(32, kNumUbBytes / (kNumHiddenBytes + kNumWeightBytes));
     static constexpr int kNumCombineTokenElems = kHidden + kNumWeightBytes / static_cast<int>(sizeof(bfloat16_t));
     using HiddenReducer = RingReducer<
@@ -98,6 +104,8 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
         const auto token_idx = token_begin +
             (relative_token_idx < num_core_tokens ? relative_token_idx : relative_token_idx - num_core_tokens);
         // Keep the last top-k slot for each destination rank.
+        // 从 top-k 尾到头按 expert owner rank 去重，选择每 rank 最后一个槽，与 dispatch/epilogue 的 master 一致。
+        // 例如 topk=[e0(rank2),e1(rank2),e2(rank5)]，只读取 slot1 的 rank2 partial 和 slot2 的 rank5 partial。
         uint64_t master_slot_mask = 0;
         uint64_t seen_ranks[math::ceil_div(kNumRanks, 64)] = {};
         #pragma unroll
@@ -109,9 +117,11 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
             const auto rank_bit = uint64_t{1} << (dst_rank_idx % 64);
             if ((seen_ranks[dst_rank_idx / 64] & rank_bit) == 0)
                 master_slot_mask |= uint64_t{1} << slot_idx;
+            // seen_ranks 是可覆盖多于 64 rank 的 bitset；重复 rank 的专家结果已在该卡合并，不能再次读多份。
             seen_ranks[dst_rank_idx / 64] |= rank_bit;
         }
         // Load biases and rank partials in accumulation order.
+        // 先加载 bias0/bias1，再按 master top-k 升序加载 partial；记录起点供后面的 weight 还原跳过 bias。
         const auto first_input_idx = reducer.slot_idx;
         int num_inputs = 0;
         for (int bias_idx = 0; bias_idx < 2; ++ bias_idx) {
@@ -127,19 +137,23 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
             if ((master_slot_mask & (uint64_t{1} << slot_idx)) == 0)
                 continue;
             auto slot_group_idx = slot_idx;
+            // rank 数较小时以 rank 号做 subslot；否则以 master top-k 槽做 subslot，匹配发送端 remote_offset。
             if constexpr (kNumRanks < kNumTopk) {
                 const auto expert_idx = combined_topk_idx[token_idx * kNumTopk + slot_idx];
                 slot_group_idx = expert_idx / (kNumExperts / kNumRanks);
             }
+            // 接收 GM 布局 [min(rank,topk)][Tmax][BF16 hidden+padded weight]；实际 T 不改变 stride。
             const auto combine_slot_idx = slot_group_idx * kNumMaxTokensPerRank + token_idx;
             const auto gm_input = buffer + static_cast<int64_t>(combine_slot_idx) * kNumCombineTokenElems;
             reducer.load_next_token(gm_input, asc_load_l2_cache_mode::NOTALLOC_KEEP,
                                     has_topk_weights ? kNumWeightBytes : 0);
             ++ num_inputs;
         }
+        // 此处只对已经在各专家 rank 局部合并的 partial（加 bias）求和，不再展开本卡专家行。
         reducer.reduce(num_inputs);
         if (has_topk_weights) {
             const auto output_idx = reducer.slot_idx == 0 ? kNumHiddenSlots - 1 : reducer.slot_idx - 1;
+            // 权重 OR 只遍历 partial 输入，跳过前 num_biases 个槽；输出 extra 区与 hidden 同槽，但有单独 Vector->MTE3 事件。
             restore_combine_weights<kNumTopk, HiddenReducer::kNumTokenElems, kNumHiddenSlots, kHidden>(
                 reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[0]),
                 reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[output_idx] + kHidden),
